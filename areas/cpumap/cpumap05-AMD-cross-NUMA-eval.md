@@ -72,6 +72,90 @@ words the `ptr_ring` (qsize 2048) is essentially always non-empty: the consumer
 outrunning the producer. A high `sched` count would instead indicate an
 underloaded kthread repeatedly going idle.
 
+### Cross-NUMA: state-mode none, RX node0 -> remote node5
+
+RX on cpu 6 (NUMA node 0), redirect to cpu 40 (NUMA node 5) -- different CCD,
+traffic must cross the Infinity Fabric / I/O die.
+
+```
+sudo ./xdp-bench redirect-cpu-state -e --cpu 40 --state-mode none ice4
+```
+
+```
+ice4->?                 4,732,816 rx/s                  0 err,drop/s
+  receive total         4,732,816 pkt/s                 0 drop/s                0 error/s
+    cpu:6               4,732,816 pkt/s                 0 drop/s                0 error/s
+  enqueue to cpu 40     4,732,812 pkt/s                 0 drop/s             8.00 bulk-avg
+    cpu:6->40           4,732,812 pkt/s                 0 drop/s             8.00 bulk-avg
+  kthread total         4,732,841 pkt/s                 0 drop/s           46,656 sched
+    cpu:40              4,732,841 pkt/s                 0 drop/s           46,656 sched
+    xdp_stats                   0 pass/s        4,732,841 drop/s                0 redir/s
+      cpu:40                    0 pass/s        4,732,841 drop/s                0 redir/s
+  xdp_exception                 0 hit/s
+```
+
+Result: **~4.7 Mpps** -- a ~2.9x drop from the ~13.8 Mpps same-NUMA baseline,
+purely from moving the remote CPU to a different NUMA node. No shared state is
+touched (`--state-mode none`); the entire penalty comes from the cpumap
+`ptr_ring` handoff itself crossing NUMA nodes.
+
+#### Reading the difference
+
+- `bulk-avg` is still `8.00`: the RX side (cpu 6) still fills full
+  `CPUMAP_BATCH` bulks -- the producer is not the thing that slowed down, it has
+  plenty of packets to enqueue.
+
+- `sched` jumped from **70 -> ~46,656/s**. Per the `cpu_map_kthread_run()` logic,
+  a high `sched` means the kthread frequently finds the `ptr_ring` empty, calls
+  `schedule()`, and sleeps until the next `wake_up_process()` from the producer.
+  So the consumer is now *starved*, not saturated: it drains the ring faster
+  than frames arrive across the fabric and repeatedly goes idle.
+
+- The bottleneck has moved to the **RX/producer CPU (cpu 6)**. The ring's
+  producer/consumer indices and the enqueued pointers live in memory that now
+  bounces between node 0 and node 5 caches, and every near-empty ring forces a
+  cross-NUMA `wake_up_process()` of the remote kthread. These costs are charged
+  to cpu 6's softirq (it does the `__ptr_ring_produce()` and the wakeup),
+  capping throughput at ~4.7 Mpps.
+
+#### Confirming the bottleneck with mpstat
+
+```
+$ mpstat -P 6,40 -u -I SCPU -I SUM 10 1
+04:28:19 PM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %idle
+04:28:19 PM    6    0.00    0.00    0.00    0.00    0.30   99.70    0.00    0.00
+04:28:19 PM   40    0.00    0.00   78.76    0.00    0.98    0.11    0.00   20.15
+
+04:28:19 PM  CPU    intr/s
+04:28:19 PM    6  74063.64
+04:28:19 PM   40    654.65
+
+04:28:19 PM  CPU    NET_RX/s    SCHED/s
+04:28:19 PM    6    74017.08      16.58
+04:28:19 PM   40        0.00     649.75
+```
+
+This confirms the picture:
+
+- **cpu 6 (RX) is pegged at 99.70% `%soft`** -- it spends essentially all its
+  time in NET_RX softirq (74k NET_RX/s), doing the XDP redirect plus the
+  cross-NUMA ring enqueue and remote wakeup. This is the saturated CPU and the
+  true bottleneck.
+
+- **cpu 40 (kthread) has 20.15% `%idle`** and only 78.76% `%sys` -- the consumer
+  is *not* saturated; it has spare capacity. Its high `SCHED/s` (649/s) matches
+  the benchmark's high `sched` counter: it keeps going to sleep because the ring
+  runs dry. Note cpu 40's work shows up as `%sys` (kthread context), not
+  `%soft`.
+
+So the ~2.9x throughput loss is dominated by the extra per-packet cost the
+producer pays to hand frames across the NUMA boundary, not by the remote XDP
+program or drop work.
+
+This is the core effect the evaluation is meant to quantify: the cpumap handoff
+is significantly more expensive cross-NUMA even before any *shared state* is
+added on top.
+
 ---
 
 ## Test setup
