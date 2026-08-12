@@ -156,6 +156,13 @@ This is the core effect the evaluation is meant to quantify: the cpumap handoff
 is significantly more expensive cross-NUMA even before any *shared state* is
 added on top.
 
+### Further investigation
+
+A deeper analysis of the cross-NUMA `ptr_ring` producer bottleneck --
+including `perf` disassembly, MOESI cacheline ownership analysis, and a
+proposal to increase `CPU_MAP_BULK_SIZE` from 8 to 16 -- is in
+[cpumap06-increase-CPU_MAP_BULK_SIZE.md](cpumap06-increase-CPU_MAP_BULK_SIZE.md).
+
 ---
 
 ## Test setup
